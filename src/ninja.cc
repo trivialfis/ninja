@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
 
 #ifdef _WIN32
 #include "getopt.h"
@@ -39,7 +40,6 @@
 #include "deps_log.h"
 #include "clean.h"
 #include "debug_flags.h"
-#include "depfile_parser.h"
 #include "disk_interface.h"
 #include "graph.h"
 #include "graphviz.h"
@@ -1447,7 +1447,7 @@ int ReadFlags(int* argc, char*** argv,
 
   int opt;
   while (!options->tool &&
-         (opt = getopt_long(*argc, *argv, "d:f:j:k:l:nt:vw:C:h", kLongOptions,
+         (opt = getopt_long(*argc, *argv, "d:f:j:k:l:nt:s:vw:C:h", kLongOptions,
                             NULL)) != -1) {
     switch (opt) {
       case 'd':
@@ -1497,6 +1497,13 @@ int ReadFlags(int* argc, char*** argv,
         if (!options->tool)
           return 0;
         break;
+      case 's': {
+        config->sched = optarg;
+        if (!std::filesystem::exists(config->sched)) {
+          Fatal("Scheduler file not found.");
+        }
+        break;
+      }
       case 'v':
         config->verbosity = BuildConfig::VERBOSE;
         break;
@@ -1522,6 +1529,10 @@ int ReadFlags(int* argc, char*** argv,
   }
   *argv += optind;
   *argc -= optind;
+
+  if (config->sched.empty() && !config->dry_run) {
+    Fatal("`-s` for a scheduler is required.");
+  }
 
   return -1;
 }

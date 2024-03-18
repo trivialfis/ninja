@@ -175,6 +175,7 @@ struct BuildConfig {
     VERBOSE
   };
   Verbosity verbosity;
+  std::string sched;
   bool dry_run;
   int parallelism;
   int failures_allowed;

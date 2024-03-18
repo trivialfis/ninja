@@ -16,10 +16,12 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <pybind11/embed.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+
 #include <climits>
-#include <stdint.h>
 #include <functional>
 
 #if defined(__SVR4) && defined(__sun)
@@ -537,7 +539,7 @@ void Plan::ScheduleInitialEdges() {
            end = want_.end(); it != end; ++it) {
     Edge* edge = it->first;
     Plan::Want want = it->second;
-    if (!(want == kWantToStart && edge->AllInputsReady())) {
+    if (want != kWantToStart || !edge->AllInputsReady()) {
       continue;
     }
 
@@ -588,12 +590,176 @@ struct RealCommandRunner : public CommandRunner {
   map<const Subprocess*, Edge*> subproc_to_edge_;
 };
 
-vector<Edge*> RealCommandRunner::GetActiveEdges() {
+template <typename It>
+vector<Edge*> GetActiveEdges(It begin, It end) {
   vector<Edge*> edges;
-  for (map<const Subprocess*, Edge*>::iterator e = subproc_to_edge_.begin();
-       e != subproc_to_edge_.end(); ++e)
+  for (auto e = begin; e != end; ++e)
     edges.push_back(e->second);
   return edges;
+}
+
+/**
+ * @brief A implementation of runner using dask.
+ *
+ * Before running ninja:
+ * - setup a dask scheduler with the `--scheduler-file` option
+ * - setup some workers with the `--scheduler-file` option
+ *
+ * Run ninja:
+ * - ninja -s <path_to_scheduler_file.json> -j <specify a large number>
+ */
+struct DaskCommandRunner : public CommandRunner {
+  const BuildConfig& config_;
+  std::map<std::shared_ptr<pybind11::object>, Edge*> fut_to_edge_;
+  std::vector<std::pair<std::shared_ptr<pybind11::object>, Edge*>> done_;
+
+ public:
+  explicit DaskCommandRunner(BuildConfig const& config) : config_(config) {
+    namespace py = pybind11;
+    py::initialize_interpreter();
+
+    auto sched = config_.sched;
+    using namespace py::literals;
+
+    auto script = R"(
+import distributed
+import subprocess
+import sys
+import collections
+
+def submit(command: str):
+    cwd = os.getcwd()
+    fut = client.compute(client.submit(task, ccargs=command, cwd=cwd))
+    return fut
+
+Result = collections.namedtuple("Result", ["rc", "out", "err"])
+
+def task(ccargs: str, cwd: str) -> Result:
+    try:
+        p = subprocess.Popen(
+            ccargs, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, shell=True,
+        )
+        out, err = p.communicate()
+        rc = p.returncode
+        return Result(rc, out.decode("utf-8"), err.decode("utf-8"))
+    except Exception as e:
+        return Result(-1, "", str(e))
+
+if __name__ == "__main__":
+    client = distributed.Client(scheduler_file="{_sched}")
+)"_s.format(**py::dict("_sched"_a=sched));
+
+    py::exec(script);
+  }
+  ~DaskCommandRunner() {
+    namespace py = pybind11;
+    py::finalize_interpreter();
+  }
+  std::size_t CanRunMore() const override {
+    size_t subproc_number = fut_to_edge_.size();
+
+    int64_t capacity = config_.parallelism - subproc_number;
+
+    if (config_.max_load_average > 0.0f) {
+      int load_capacity = config_.max_load_average - GetLoadAverage();
+      if (load_capacity < capacity)
+        capacity = load_capacity;
+    }
+
+    if (capacity < 0)
+      capacity = 0;
+
+    if (capacity == 0) {
+      // Ensure that we make progress.
+      capacity = 1;
+    }
+
+    return capacity * 2;  // over-subscribe
+  }
+
+  bool StartCommand(Edge* edge) override {
+    namespace py = pybind11;
+    string command = edge->EvaluateCommand();
+    auto fut = py::globals()["submit"](command);
+    fut_to_edge_.insert(make_pair(std::make_shared<py::object>(fut), edge));
+
+    return true;
+  }
+
+  bool WaitForCommand(Result* result) override {
+    namespace py = pybind11;
+
+    auto get_result =
+        [result](decltype(fut_to_edge_)::value_type const& fut_e) {
+          py::object res;
+          bool except{ false };
+          try {
+            res = fut_e.first->attr("result")();
+            result->status =
+                res.attr("rc").cast<int>() == 0 ? ExitSuccess : ExitFailure;
+          } catch (pybind11::error_already_set const& e) {
+            if (e.matches(PyExc_KeyboardInterrupt)) {
+              result->status = ExitInterrupted;
+            } else {
+              // This can not happen in theory since `task` doesn't throw
+              // exception given correct command.
+              result->status = ExitFailure;
+              except = true;
+            }
+          };
+
+          if (result->status != ExitInterrupted && !except) {
+            result->output = res.attr("out").cast<string>();
+            result->output += res.attr("err").cast<string>();
+          }
+
+          result->edge = fut_e.second;
+          return fut_e.first;
+        };
+
+    auto take_from_done = [this, get_result, result]() {
+      auto fut = get_result(done_.back());
+      assert(fut != nullptr && "Invalid wait.");
+      fut_to_edge_.erase(fut);
+      done_.pop_back();
+      return result->status != ExitInterrupted;
+    };
+
+    if (!done_.empty()) {
+      return take_from_done();
+    }
+
+    for (auto const& fut_e : fut_to_edge_) {
+      bool is_finished = fut_e.first->attr("done")().cast<bool>();
+      if (is_finished) {
+        done_.push_back(fut_e);
+      }
+    }
+
+    // Force one to complete
+    if (done_.empty()) {
+      done_.push_back(*fut_to_edge_.cbegin());
+    }
+
+    return take_from_done();
+  }
+
+  void Abort() override {
+    namespace py = pybind11;
+    for (auto& kv : fut_to_edge_) {
+      kv.first->attr("cancel")();
+    }
+    fut_to_edge_.clear();
+    done_.clear();
+  }
+
+  vector<Edge*> GetActiveEdges() override {
+    return ::GetActiveEdges(fut_to_edge_.begin(), fut_to_edge_.end());
+  }
+};
+
+vector<Edge*> RealCommandRunner::GetActiveEdges() {
+  return ::GetActiveEdges(subproc_to_edge_.begin(), subproc_to_edge_.end());
 }
 
 void RealCommandRunner::Abort() {
@@ -757,7 +923,7 @@ bool Builder::Build(string* err) {
     if (config_.dry_run)
       command_runner_.reset(new DryRunCommandRunner);
     else
-      command_runner_.reset(new RealCommandRunner(config_));
+      command_runner_.reset(new DaskCommandRunner(config_));
   }
 
   // We are about to start the build process.

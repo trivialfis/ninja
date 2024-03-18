@@ -178,7 +178,7 @@ target_compile_features(libninja PUBLIC cxx_std_11)
 
 #Fixes GetActiveProcessorCount on MinGW
 if(MINGW)
-target_compile_definitions(libninja PRIVATE _WIN32_WINNT=0x0601 __USE_MINGW_ANSI_STDIO=1)
+  target_compile_definitions(libninja PRIVATE _WIN32_WINNT=0x0601 __USE_MINGW_ANSI_STDIO=1)
 endif()
 
 # On IBM i (identified as "OS400" for compatibility reasons) and AIX, this fixes missing
@@ -186,6 +186,9 @@ endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "OS400" OR CMAKE_SYSTEM_NAME STREQUAL "AIX")
 	add_compile_definitions(__STDC_FORMAT_MACROS)
 endif()
+
+find_package(pybind11 REQUIRED)
+target_link_libraries(libninja pybind11::embed)
 
 # Main executable is library plus main() function.
 if(NINJA_BUILD_BINARY)
